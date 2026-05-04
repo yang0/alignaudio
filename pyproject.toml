@@ -1,0 +1,44 @@
+[build-system]
+requires = ["setuptools>=64", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "alignaudio"
+version = "0.2.0"
+description = "视频配音对齐 — 将配音音频逐段对齐到原始视频，支持 RIFE GPU 运动插帧"
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.10"
+authors = [{ name = "AlignAudio Contributors" }]
+keywords = ["video", "dubbing", "frame-interpolation", "rife", "ffmpeg", "audio-alignment"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Topic :: Multimedia :: Video",
+    "Topic :: Multimedia :: Sound/Audio",
+    "Programming Language :: Python :: 3",
+]
+
+dependencies = [
+    "numpy",
+    "opencv-python>=4.1",
+    "torch>=2.0",
+]
+
+[project.optional-dependencies]
+dev = ["tqdm", "sk-video", "moviepy", "torchvision"]
+
+[project.scripts]
+align-video  = "align_video_to_dubbing:main"
+align-audio  = "align_dubbed_audio:main"
+adjust-subs  = "adjust_subtitle_timestamps:main"
+
+[tool.setuptools]
+py-modules = [
+    "align_video_to_dubbing",
+    "align_video_dubbing",
+    "align_dubbed_audio",
+    "adjust_subtitle_timestamps",
+    "rife_interpolator",
+    "preview_3seg",
+]
