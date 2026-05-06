@@ -11,13 +11,8 @@ venv/
 train_log/
 ECCV2022-RIFE/
 
-# Test outputs (generated videos)
-test/*.mp4
-test/*.srt
-test/*.png
-test/*.wav
-test/dubbed_output/
-test/tmp_test/
+# Test directory (entirely excluded)
+/test/
 
 # IDE
 .vscode/

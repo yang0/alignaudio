@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "alignaudio"
-version = "0.2.0"
+version = "0.3.0"
 description = "视频配音对齐 — 将配音音频逐段对齐到原始视频，支持 RIFE GPU 运动插帧"
 readme = "README.md"
 license = { text = "MIT" }

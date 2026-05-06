@@ -18,7 +18,7 @@ except Exception:
     _rife_available = False
 
 # ── P1 配置常量 ──
-AUDIO_ONLY_THRESHOLD = 0.10           # |ratio-1| 在此阈值内使用纯音频拉伸，超过则双向分担
+AUDIO_ONLY_THRESHOLD = 0.20           # |ratio-1| 在此阈值内使用纯音频拉伸（视频零损耗），超过则双向分担
 SCENE_SNAP_RANGE = 0.5                # 场景边界吸附范围（秒）
 
 def parse_srt(srt_path):
@@ -134,21 +134,31 @@ def snap_to_scene(time, scene_times, range_sec=SCENE_SNAP_RANGE):
             nearest = st
     return nearest if nearest is not None else time
 
-def cut_video_segment(video_path, start, end, output_path):
+def cut_video_segment(video_path, start, end, output_path, fast=False):
     """
     从视频中切出指定时间段（精确帧边界，重编码切边）
     修复: 去掉 -c:v copy，改为重编码以保证帧边界精确
+    fast=True: 使用 -c:v copy 快速切割（适用于视频未修改的场景）
     """
     duration = end - start
-    cmd = [
-        'ffmpeg', '-y',
-        '-i', str(video_path),              # -i 在 -ss 之前 = 帧精确切割
-        '-ss', str(start),                  # 输入 seek 到精确时间
-        '-t', str(duration),
-        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
-        '-an',
-        str(output_path)
-    ]
+    if fast:
+        # Keyframe-accurate cut, no re-encode (for astretch: video unchanged, audio stretched to match)
+        cmd = [
+            'ffmpeg', '-y', '-ss', str(start), '-t', str(duration),
+            '-i', str(video_path), '-c:v', 'copy', '-an',
+            str(output_path)
+        ]
+    else:
+        # Frame-accurate cut with re-encode
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', str(video_path),              # -i 在 -ss 之前 = 帧精确切割
+            '-ss', str(start),                  # 输入 seek 到精确时间
+            '-t', str(duration),
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            '-an',
+            str(output_path)
+        ]
     subprocess.run(cmd, capture_output=True)
 
 def _setpts_adjust(video_segment, speed_ratio, output_path):
@@ -162,6 +172,38 @@ def _setpts_adjust(video_segment, speed_ratio, output_path):
     ]
     subprocess.run(cmd, capture_output=True)
 
+def _cut_and_adjust_segment(video_path, start, end, speed_ratio, output_path):
+    """Single ffmpeg pass: cut segment + apply setpts or framerate."""
+    duration = end - start
+    if 0.85 <= speed_ratio <= 1.15:
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', str(video_path),
+            '-ss', str(start), '-t', str(duration),
+            '-vf', f'setpts={speed_ratio}*PTS',
+            '-an',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            str(output_path)
+        ]
+        subprocess.run(cmd, capture_output=True)
+        return "setpts"
+    elif speed_ratio < 0.85:
+        cmd = [
+            'ffmpeg', '-y',
+            '-i', str(video_path),
+            '-ss', str(start), '-t', str(duration),
+            '-vf',
+            f'setpts={speed_ratio}*PTS,'
+            f'framerate=fps=30:interp_start=0:interp_end=100:scene=100',
+            '-an',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            str(output_path)
+        ]
+        subprocess.run(cmd, capture_output=True)
+        return "framerate"
+    else:
+        raise ValueError(f"_cut_and_adjust_segment: unsupported speed_ratio {speed_ratio}")
+
 def _rife_slowdown(video_segment, speed_ratio, output_path):
     """
     RIFE GPU 运动插帧减速 - 流式逐帧处理，显存友好
@@ -173,6 +215,7 @@ def _rife_slowdown(video_segment, speed_ratio, output_path):
         return False
     
     ok, elapsed, nframes = rife_slowdown(video_segment, speed_ratio, output_path)
+    return ok
     return ok
 
 def _framerate_speedup(video_segment, speed_ratio, output_path):
@@ -196,8 +239,8 @@ def adjust_video_speed(video_segment, speed_ratio, output_path):
     
     speed_ratio 范围         │ 策略                  │ 原因
     0.95 ~ 1.05              │ 直接复制              │ 肉眼无感
-    0.85 ~ 1.15              │ setpts 裸调            │ 变化小，卡顿不明显
-    > 1.15                   │ RIFE GPU 插帧          │ 减速明显 → 运动插帧
+    0.85 ~ 1.08              │ setpts 裸调            │ 变化小，卡顿不明显
+    > 1.08                   │ RIFE GPU 插帧          │ 减速明显 → 运动插帧
     < 0.85                   │ framerate 混合帧       │ 加速跳帧有生硬感
     """
     # 基本不变 → 直接复制
@@ -261,13 +304,19 @@ def get_video_info(video_path):
     return None
 
 def merge_video_audio(video_path, audio_path, output_path):
-    """合并视频和音频（固定采样率 16kHz 确保 concat 兼容）"""
+    """合并视频和音频（精确截断到公共时长，消除 PTS 缝隙）"""
+    # 测量实际时长
+    vid_dur = get_audio_duration(video_path)
+    aud_dur = get_audio_duration(audio_path)
+    min_dur = min(vid_dur, aud_dur)
+    
     cmd = [
         'ffmpeg', '-y',
         '-i', str(video_path),
         '-i', str(audio_path),
         '-c:v', 'copy',
         '-c:a', 'aac', '-b:a', '192k', '-ar', '16000',
+        '-t', str(min_dur),
         str(output_path)
     ]
     subprocess.run(cmd, capture_output=True)
@@ -315,8 +364,19 @@ def _process_one_segment(args):
 
     if not audio_stretch:
         # ── 音频拉伸完全禁用：仅调整视频 ──
-        cut_video_segment(video_path, start, end, segment_video)
-        method = adjust_video_speed(segment_video, speed_ratio, adjusted_video)
+        if 0.95 <= speed_ratio <= 1.05:
+            # Near-1.0: fast cut (gap segments etc, re-encode to h264 for concat compatibility)
+            subprocess.run(['ffmpeg', '-y', '-ss', str(start), '-i', str(video_path),
+                '-t', str(end-start), '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-an',
+                str(adjusted_video)], capture_output=True)
+            method = "copy"
+        elif speed_ratio > 1.15 and _rife_available and rife_slowdown is not None:
+            # RIFE path needs separate cut step (RIFE takes segment_video as input)
+            cut_video_segment(video_path, start, end, segment_video)
+            method = adjust_video_speed(segment_video, speed_ratio, adjusted_video)
+        else:
+            # setpts (0.85~0.95, 1.05~1.15) or framerate (<0.85) — single ffmpeg pass
+            method = _cut_and_adjust_segment(video_path, start, end, speed_ratio, adjusted_video)
         merge_video_audio(adjusted_video, dubbed_file, final_segment)
 
         segment_video.unlink(missing_ok=True)
@@ -343,16 +403,24 @@ def _process_one_segment(args):
     # ── 双向分担：音频和视频各走一半的差距 ──
     split_ratio = speed_ratio ** 0.5
 
-    # Step 1: 先切视频，获取实际时长（非理论值）
+    # Step 1: 先切视频
     cut_video_segment(video_path, start, end, segment_video)
-    actual_vid_dur = get_audio_duration(segment_video)
 
-    # Step 2: 拉伸音频，目标匹配调整后的视频时长
-    stretched_audio = segments_dir / f"stretched_{i:04d}.wav"
-    stretch_audio(dubbed_file, stretched_audio, actual_vid_dur * split_ratio)
-
-    # Step 3: 视频按 split_ratio 调整速度
+    # Step 2: 视频按 split_ratio 调整速度（用原有自适应策略）
     vid_method = adjust_video_speed(segment_video, split_ratio, adjusted_video)
+
+    # Step 3: 拉伸音频，精确匹配调整后的实际视频时长
+    actual_adj_dur = get_audio_duration(adjusted_video)
+    stretched_audio = segments_dir / f"stretched_{i:04d}.wav"
+    stretch_audio(dubbed_file, stretched_audio, actual_adj_dur)
+
+    # Step 4: 合并
+    merge_video_audio(adjusted_video, stretched_audio, final_segment)
+
+    # Step 3: 拉伸音频，精确匹配调整后的实际视频时长
+    actual_adj_dur = get_audio_duration(adjusted_video)
+    stretched_audio = segments_dir / f"stretched_{i:04d}.wav"
+    stretch_audio(dubbed_file, stretched_audio, actual_adj_dur)
 
     # Step 4: 合并
     merge_video_audio(adjusted_video, stretched_audio, final_segment)
@@ -433,118 +501,183 @@ def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, wo
             print(f"[WARN] 检查点读取失败: {e}")
             completed = set()
 
+    # 5. 检测字幕间隙并生成静默音频片段
+    gap_silence_files = []
+    extended_items = []  # list of (kind, orig_idx, start, end, dubbed_file)
+    for i, ((start, end), dubbed_file) in enumerate(zip(timestamps, dubbed_files), 1):
+        extended_items.append(("normal", i, start, end, dubbed_file))
+        if i < len(timestamps):
+            next_start = timestamps[i][0]
+            gap = next_start - end
+            if gap > 0.01:
+                silence_path = segments_dir / f"silence_{len(extended_items)+1:04d}.wav"
+                subprocess.run(
+                    [
+                        'ffmpeg', '-y', '-f', 'lavfi', '-i', 'anullsrc=r=16000:cl=mono',
+                        '-t', str(gap), '-acodec', 'pcm_s16le', str(silence_path)
+                    ],
+                    capture_output=True
+                )
+                gap_silence_files.append(silence_path)
+                extended_items.append(("gap", None, end, next_start, silence_path))
+
+    total_segments = len(extended_items)
+    print(f"[INFO] 共 {len(timestamps)} 段字幕, 检测到 {total_segments - len(timestamps)} 个间隙, 总片段数 {total_segments}")
+
     # 同时检查已存在的输出文件
-    for i in range(1, len(timestamps) + 1):
+    for i in range(1, total_segments + 1):
         if (segments_dir / f"final_{i:04d}.mp4").exists():
             completed.add(i)
 
     if len(completed) > 0 and not resume:
         print(f"[INFO] 发现 {len(completed)} 个已存在的片段，将跳过")
 
-    # 构建任务列表（应用场景边界吸附）
-    tasks = []
-    for i, ((start, end), dubbed_file) in enumerate(zip(timestamps, dubbed_files), 1):
-        if i not in completed:
-            orig_start, orig_end = start, end
-            if scene_snap and scene_times:
-                start = snap_to_scene(start, scene_times)
-                end = snap_to_scene(end, scene_times)
-                if start != orig_start or end != orig_end:
-                    print(f"[SCENE] seg {i}: start {orig_start:.2f}→{start:.2f}, end {orig_end:.2f}→{end:.2f}")
-            tasks.append((i, video_path, start, end, dubbed_file, segments_dir, audio_stretch))
+    # 构建任务列表并预分类（应用场景边界吸附 + 两阶段调度）
+    rife_tasks = []
+    non_rife_tasks = []
+    gap_ids = set()
+
+    for idx, (kind, orig_idx, start, end, dubbed_file) in enumerate(extended_items, 1):
+        if idx in completed:
+            continue
+
+        if kind == "gap":
+            gap_ids.add(idx)
+            # Gap segments: audio_stretch=False, no speed adjustment needed
+            task = (idx, video_path, start, end, dubbed_file, segments_dir, False)
+            non_rife_tasks.append(task)
+            continue
+
+        # Normal segment processing
+        orig_start, orig_end = start, end
+        if scene_snap and scene_times:
+            start = snap_to_scene(start, scene_times)
+            end = snap_to_scene(end, scene_times)
+            if start != orig_start or end != orig_end:
+                print(f"[SCENE] seg {orig_idx}: start {orig_start:.2f}→{start:.2f}, end {orig_end:.2f}→{end:.2f}")
+
+        # 预分类：判断是否需要 RIFE GPU 插帧
+        video_duration = end - start
+        audio_duration = get_audio_duration(dubbed_file)
+        speed_ratio = audio_duration / video_duration
+        deviation = abs(speed_ratio - 1.0)
+
+        if not audio_stretch:
+            is_rife = (speed_ratio > 1.15 and _rife_available)
+        elif deviation <= AUDIO_ONLY_THRESHOLD:
+            is_rife = False
+        else:
+            split_ratio = speed_ratio ** 0.5
+            is_rife = (split_ratio > 1.15 and _rife_available)
+
+        task = (idx, video_path, start, end, dubbed_file, segments_dir, audio_stretch)
+        if is_rife:
+            rife_tasks.append(task)
+        else:
+            non_rife_tasks.append(task)
 
     method_counts = {
         "copy": 0, "setpts": 0, "rife": 0, "setpts-fallback": 0, "framerate": 0,
-        "astretch": 0,
+        "astretch": 0, "gap": 0,
         "bi-copy": 0, "bi-setpts": 0, "bi-rife": 0, "bi-setpts-fallback": 0, "bi-framerate": 0,
     }
 
-    if tasks:
-        print(f"[WORK] 并行处理中 (workers={workers})...")
-        lock = threading.Lock()
-        start_time = time.time()
+    lock = threading.Lock()
+    start_time = time.time()
 
+    def _on_done(i, method):
+        with lock:
+            if method != "existing":
+                method_counts[method] = method_counts.get(method, 0) + 1
+            completed.add(i)
+
+            # 写入检查点
+            checkpoint = {
+                "output": str(output_path),
+                "completed": sorted(completed),
+                "total": total_segments
+            }
+            try:
+                with open(checkpoint_path, 'w', encoding='utf-8') as f:
+                    json.dump(checkpoint, f)
+            except Exception as e:
+                print(f"\n[WARN] 检查点写入失败: {e}")
+
+            # 进度报告
+            elapsed = time.time() - start_time
+            done_count = len(completed)
+            avg_time = elapsed / done_count if done_count > 0 else 0
+
+            counts_str = " ".join(f"{k}={v}" for k, v in [
+                ("rife", method_counts.get("rife", 0) + method_counts.get("setpts-fallback", 0)
+                 + method_counts.get("bi-rife", 0) + method_counts.get("bi-setpts-fallback", 0)),
+                ("setpts", method_counts.get("setpts", 0) + method_counts.get("bi-setpts", 0)),
+                ("astretch", method_counts.get("astretch", 0)),
+                ("gap", method_counts.get("gap", 0)),
+                ("copy", method_counts.get("copy", 0) + method_counts.get("bi-copy", 0)),
+                ("framerate", method_counts.get("framerate", 0) + method_counts.get("bi-framerate", 0))
+            ])
+            print(f"\r  完成: {done_count}/{total_segments} | {counts_str} | ~{avg_time:.1f}s/段", end="", flush=True)
+
+    # Phase 1: 非 RIFE 段并行处理
+    if non_rife_tasks:
+        print(f"[WORK] 非RIFE段并行处理 ({len(non_rife_tasks)}段, workers={workers})...")
         with ThreadPoolExecutor(max_workers=workers) as executor:
-            futures = {executor.submit(_process_one_segment, task): task[0] for task in tasks}
-
+            futures = {executor.submit(_process_one_segment, task): task[0] for task in non_rife_tasks}
             for future in as_completed(futures):
                 idx = futures[future]
                 try:
                     i, method, final_path = future.result()
-
-                    with lock:
-                        if method != "existing":
-                            method_counts[method] = method_counts.get(method, 0) + 1
-                        completed.add(i)
-
-                        # 写入检查点
-                        checkpoint = {
-                            "output": str(output_path),
-                            "completed": sorted(completed),
-                            "total": len(timestamps)
-                        }
-                        try:
-                            with open(checkpoint_path, 'w', encoding='utf-8') as f:
-                                json.dump(checkpoint, f)
-                        except Exception as e:
-                            print(f"\n[WARN] 检查点写入失败: {e}")
-
-                        # 进度报告
-                        elapsed = time.time() - start_time
-                        done_count = len(completed)
-                        avg_time = elapsed / done_count if done_count > 0 else 0
-
-                        counts_str = " ".join(f"{k}={v}" for k, v in [
-                            ("rife", method_counts.get("rife", 0) + method_counts.get("setpts-fallback", 0)
-                             + method_counts.get("bi-rife", 0) + method_counts.get("bi-setpts-fallback", 0)),
-                            ("setpts", method_counts.get("setpts", 0) + method_counts.get("bi-setpts", 0)),
-                            ("astretch", method_counts.get("astretch", 0)),
-                            ("copy", method_counts.get("copy", 0) + method_counts.get("bi-copy", 0)),
-                            ("framerate", method_counts.get("framerate", 0) + method_counts.get("bi-framerate", 0))
-                        ])
-                        print(f"\r  完成: {done_count}/{len(timestamps)} | {counts_str} | ~{avg_time:.1f}s/段", end="", flush=True)
-
+                    _on_done(i, method)
                 except Exception as e:
                     print(f"\n[ERROR] 处理片段 {idx} 失败: {e}")
                     return False
+        print()  # 换行
 
+    # Phase 2: RIFE 段串行 GPU 处理
+    if rife_tasks:
+        print(f"[WORK] RIFE段串行GPU处理 ({len(rife_tasks)}段)...")
+        for task in rife_tasks:
+            try:
+                i, method, final_path = _process_one_segment(task)
+                _on_done(i, method)
+            except Exception as e:
+                print(f"\n[ERROR] 处理 RIFE 片段 {task[0]} 失败: {e}")
+                return False
         print()  # 换行
 
     # 收集所有片段（按索引排序）
     adjusted_segments = []
-    for i in range(1, len(timestamps) + 1):
+    for i in range(1, total_segments + 1):
         final_segment = segments_dir / f"final_{i:04d}.mp4"
         if not final_segment.exists():
             print(f"[ERROR] 片段 {i} 输出文件缺失")
             return False
         adjusted_segments.append(str(final_segment))
 
-    # 6. 合并所有段
-    print(f"[WORK] 策略统计: copy={method_counts['copy']+method_counts.get('bi-copy',0)}, "
-          f"setpts={method_counts['setpts']+method_counts.get('bi-setpts',0)}, "
-          f"rife={method_counts['rife']+method_counts.get('bi-rife',0)}, "
-          f"astretch={method_counts['astretch']}, "
-          f"framerate={method_counts['framerate']+method_counts.get('bi-framerate',0)}")
+    # 6. 合并所有段（用 Python 直接串接，跳过 concat demuxer）
+    print(f"[WORK] 策略统计: {', '.join(f'{k}={v}' for k,v in sorted(method_counts.items()) if v>0)}")
     print("[WORK] 合并所有调整后的片段...")
 
-    with tempfile.NamedTemporaryFile(mode='w', suffix='.txt', delete=False) as f:
-        for segment in adjusted_segments:
-            # 使用绝对路径 + 正斜杠（concat 文件在 Temp 目录，相对路径会错）
-            abs_path = str(Path(segment).resolve()).replace(chr(92), '/')
-            f.write(f"file '{abs_path}'\n")
-        concat_file = f.name
-
-    cmd = [
-        'ffmpeg', '-y', '-fflags', '+genpts', '-f', 'concat', '-safe', '0',
-        '-i', concat_file,
-        '-c', 'copy',
+    # 方式: 所有段作为 ffmpeg 多输入，concat 滤镜合并
+    inputs = []
+    for seg in adjusted_segments:
+        inputs.extend(['-i', seg])
+    
+    n = len(adjusted_segments)
+    filter_parts = ''.join(f'[{i}:v][{i}:a]' for i in range(n))
+    filter_graph = f'{filter_parts}concat=n={n}:v=1:a=1[outv][outa]'
+    
+    concat_cmd = ['ffmpeg', '-y'] + inputs + [
+        '-filter_complex', filter_graph,
+        '-map', '[outv]', '-map', '[outa]',
+        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        '-c:a', 'aac', '-b:a', '192k', '-ar', '16000',
         str(output_path)
     ]
-    result = subprocess.run(cmd, capture_output=True, text=True)
-    os.unlink(concat_file)
-    
+    result = subprocess.run(concat_cmd, capture_output=True, text=True)
+
     if result.returncode == 0:
-        ...
         output_info = get_video_info(output_path)
         total_audio_duration = sum(get_audio_duration(f) for f in dubbed_files)
         print(f"[OK] 处理完成!")
@@ -572,11 +705,15 @@ if __name__ == "__main__":
         description="视频配音对齐工具 (混合策略版 + 并行处理)",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""速度调整策略:
-  0.95~1.05  → 直接复制 (肉眼无感)
-  0.85~1.15  → setpts 裸调
-  > 1.15     → RIFE GPU 运动插帧 (减速)
+  |ratio-1| <= 0.10 → 纯音频拉伸 (视频原画质)
+  > 0.10           → 双向分担 (音频+视频各调一半)
+  > 1.15           → RIFE GPU 运动插帧 (减速, 串行GPU处理)
                └ 不可用时 setpts 兜底
-  < 0.85     → framerate 混合帧 (加速)
+  < 0.85           → framerate 混合帧 (加速)
+
+调度策略:
+  非RIFE段 → 多线程并行 (workers)
+  RIFE段   → GPU串行 (避免显存争抢)
 
 示例:
   python align_video_to_dubbing.py test/video_zh.srt test/video_no_audio.mp4 test/dubbed_output test/final_output.mp4 --workers 4

@@ -50,75 +50,81 @@ def _t2np(t, oh, ow):
 def rife_slowdown(input_video, speed_ratio, output_video):
     """
     RIFE GPU 运动插帧减速（流式，显存友好）
-    
-    策略: RIFE 2^passes 倍增 → setpts 微调
-    speed_ratio=1.5 → 2x RIFE + setpts=0.75
-    speed_ratio=2.3 → 4x RIFE + setpts=0.575
+
+    策略: RIFE 2^passes 倍增 → 直接写入目标 FPS（无需二次 setpts）
+    speed_ratio=1.5 → 2x RIFE, output_fps = 2*fps / 1.5
+    speed_ratio=2.3 → 4x RIFE, output_fps = 4*fps / 2.3
     """
     t0 = time.time()
     model = _get_model()
-    
+
     cap = cv2.VideoCapture(str(input_video))
     fps = cap.get(cv2.CAP_PROP_FPS)
     w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
     h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
     nframes = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
-    
+
     multiplier = max(2, int(np.ceil(speed_ratio)))
     passes = max(1, int(np.ceil(np.log2(multiplier))))
-    
+    target_fps = fps * (2**passes) / speed_ratio
+
     with tempfile.TemporaryDirectory() as td:
         tmpdir = Path(td)
-        curr_input = tmpdir / "s0.mp4"
-        
-        # RIFE 2x 逐帧流式
-        _stream_2x(cap, model, fps, w, h, str(curr_input))
-        cap.release()
-        
-        for level in range(1, passes):
-            next_input = tmpdir / f"s{level}.mp4"
-            cap2 = cv2.VideoCapture(str(curr_input))
-            _stream_2x(cap2, model, fps * (2**level), w, h, str(next_input))
-            cap2.release()
-            curr_input.unlink(missing_ok=True)
-            curr_input = next_input
-        
-        # setpts 微调: setpts=speed_ratio 直接拉伸到目标时长
-        # RIFE 提供的是帧密度(60fps→120fps)，setpts 负责时长
-        ratio = speed_ratio
-        r = subprocess.run([
-            'ffmpeg','-y','-i',str(curr_input),
-            '-vf',f'setpts={ratio}*PTS',
-            '-c:v','libx264','-preset','fast','-crf','18','-an',
-            str(output_video)
-        ], capture_output=True, text=True)
-    
+
+        if passes == 1:
+            # 单级 2x：直接以目标 FPS 写出，无需中间文件
+            _stream_2x(cap, model, fps, w, h, str(output_video), output_fps=target_fps)
+            cap.release()
+        else:
+            # 多级倍增：中间级写临时文件，末级以目标 FPS 写出
+            curr_input = tmpdir / "s0.mp4"
+            _stream_2x(cap, model, fps, w, h, str(curr_input))
+            cap.release()
+
+            for level in range(1, passes):
+                next_input = tmpdir / f"s{level}.mp4"
+                cap2 = cv2.VideoCapture(str(curr_input))
+                _stream_2x(cap2, model, fps * (2**level), w, h, str(next_input))
+                cap2.release()
+                time.sleep(0.1)  # Windows 文件句柄释放延迟
+                curr_input.unlink(missing_ok=True)
+                curr_input = next_input
+
+            # 末级：以目标 FPS 写出
+            cap_last = cv2.VideoCapture(str(curr_input))
+            _stream_2x(cap_last, model, fps * (2**passes), w, h, str(output_video), output_fps=target_fps)
+            cap_last.release()
+
     elapsed = time.time() - t0
-    return (r.returncode == 0, elapsed, nframes)
+    return (True, elapsed, nframes)
 
 
-def _stream_2x(cap, model, fps, w, h, outpath):
-    """流式 2x 插帧：逐帧→插值→写盘，仅2帧在GPU"""
+def _stream_2x(cap, model, fps, w, h, outpath, output_fps=None):
+    """流式 2x 插帧：逐帧→插值→写盘，仅2帧在GPU。output_fps 给定则直接以该帧率写出。"""
+    actual_fps = output_fps if output_fps is not None else fps * 2
     fourcc = cv2.VideoWriter_fourcc(*'mp4v')
-    out = cv2.VideoWriter(outpath, fourcc, fps*2, (w, h))
-    
+    out = cv2.VideoWriter(outpath, fourcc, actual_fps, (w, h))
+
     ret, prev = cap.read()
     if not ret:
         out.release(); return
     out.write(prev)
-    
+
     pt = _np2t(prev); pt, ph, pw = _pad_to_multiple(pt, 64)
     idx = 1
     while True:
         ret, cur = cap.read()
         if not ret: break
         ct = _np2t(cur); ct, _, _ = _pad_to_multiple(ct, 64)
-        
+
+        # FP16 自动混合精度推理 + scale=2 降内部分辨率加速
         with torch.no_grad():
-            mid = model.inference(pt, ct, timestep=0.5)
+            with torch.amp.autocast('cuda'):
+                mid = model.inference(pt, ct, timestep=0.5, scale=1.0)
+
         out.write(_t2np(mid, h, w))
         out.write(cur)
-        
+
         del pt; pt = ct
         idx += 1
         if idx % 60 == 0:
