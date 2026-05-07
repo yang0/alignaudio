@@ -433,6 +433,124 @@ def _process_one_segment(args):
     return (i, f"bi-{vid_method}", str(final_segment))
 
 
+def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=True, scene_snap=False):
+    """
+    单命令 ffmpeg 快速管道：所有非 RIFE 段在一个 filter_complex 中处理。
+    速度：1 个 ffmpeg 进程 vs 630 个子进程。
+    """
+    print("[WORK] 单命令快速管道...")
+
+    timestamps = parse_srt(srt_path)
+    ddir = Path(dubbed_dir)
+    dubbed_files = sorted(ddir.glob("*.wav"))
+    if len(timestamps) != len(dubbed_files):
+        min_count = min(len(timestamps), len(dubbed_files))
+        timestamps = timestamps[:min_count]
+        dubbed_files = dubbed_files[:min_count]
+
+    n = len(timestamps)
+    print(f"[INFO] {n} 段字幕, 单命令处理")
+
+    # 场景吸附（可选）
+    scene_times = []
+    if scene_snap:
+        print("[INFO] 场景吸附检测中...")
+        scene_times = detect_scene_changes(video_path)
+
+    # ── 预计算所有段的参数 ──
+    segment_params = []  # list of (start, end, v_ratio, a_ratio, audio_path)
+    for i, ((start, end), wav) in enumerate(zip(timestamps, dubbed_files)):
+        if scene_snap and scene_times:
+            start = snap_to_scene(start, scene_times)
+            end = snap_to_scene(end, scene_times)
+        vid_dur = end - start
+        aud_dur = get_audio_duration(wav)
+        ratio = aud_dur / vid_dur
+        if audio_stretch and abs(ratio - 1) <= 0.20:
+            segment_params.append((start, end, 1.0, ratio, wav))
+        else:
+            split = ratio ** 0.5
+            segment_params.append((start, end, split, split, wav))
+
+    # ── 构建 filter_complex ──
+    video_input = str(Path(video_path).resolve())
+    audio_inputs = [video_input]  # [0] = video
+    filters = []
+    concat_labels = []
+    seg_idx = 0
+
+    for idx, (s, e, vr, ar, wav) in enumerate(segment_params):
+        audio_inputs.append(str(Path(wav).resolve()))
+        in_audio = idx + 1
+
+        vl = f'v{seg_idx}'
+        al = f'a{seg_idx}'
+        filters.append(f"[0:v]trim=start={s}:end={e},setpts=(PTS-STARTPTS)*{vr}[{vl}]")
+        filters.append(f"[{in_audio}:a]rubberband=tempo={ar}[{al}]")
+        concat_labels.extend([f"[{vl}]", f"[{al}]"])
+        seg_idx += 1
+
+        # 间隙段
+        if idx + 1 < len(segment_params):
+            next_s = segment_params[idx + 1][0]
+            gap = next_s - e
+            if gap > 0.01:
+                vl = f'v{seg_idx}'
+                al = f'a{seg_idx}'
+                filters.append(f"[0:v]trim=start={e}:end={next_s},setpts=PTS-STARTPTS[{vl}]")
+                filters.append(f"aevalsrc=0.0:d={gap}:sample_rate=16000[{al}]")
+                concat_labels.extend([f"[{vl}]", f"[{al}]"])
+                seg_idx += 1
+
+    total_segs = seg_idx
+    filters.append(f"{''.join(concat_labels)}concat=n={total_segs}:v=1:a=1[outv][outa]")
+    filter_graph = ';'.join(filters)
+
+    # ── 执行 ──
+    # 小数据集直接用命令行；大数据集用 @file（Windows 兼容写法）
+    if total_segs <= 60:
+        cmd = ['ffmpeg', '-y']
+        for inp in audio_inputs:
+            cmd.extend(['-i', str(Path(inp).resolve())])
+        cmd.extend([
+            '-filter_complex', filter_graph,
+            '-map', '[outv]', '-map', '[outa]',
+            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            '-c:a', 'aac', '-b:a', '192k', '-ar', '16000',
+            str(Path(output_path).resolve())
+        ])
+    else:
+        arg_path = Path(str(output_path) + ".ffargs.txt")
+        with open(arg_path, 'w', encoding='utf-8') as f:
+            for inp in audio_inputs:
+                p = str(Path(inp).resolve()).replace('\\', '/')
+                f.write(f"-i\n{p}\n")
+            f.write(f"-filter_complex\n{filter_graph}\n")
+            f.write("-map\n[outv]\n-map\n[outa]\n")
+            f.write("-c:v\nlibx264\n-preset\nfast\n-crf\n18\n")
+            f.write("-c:a\naac\n-b:a\n192k\n-ar\n16000\n")
+            f.write(str(Path(output_path).resolve()).replace('\\', '/'))
+        cmd = ['ffmpeg', '-y', f'@{arg_path.resolve()}']
+
+    print(f"[WORK] 开始 ffmpeg ({total_segs} 段, 1 个进程)...")
+    t0 = time.time()
+    result = subprocess.run(cmd, capture_output=True, text=True)
+    t1 = time.time()
+    if total_segs > 60:
+        arg_path.unlink(missing_ok=True)
+
+    if result.returncode == 0:
+        output_info = get_video_info(output_path)
+        print(f"[OK] 快速管道完成 ({t1-t0:.0f}s)")
+        if output_info:
+            print(f"   输出文件: {output_path}")
+            print(f"   输出时长: {output_info['duration']:.2f}秒")
+        return True
+    else:
+        print(f"[ERROR] ffmpeg 失败 ({t1-t0:.0f}s): {result.stderr[-600:]}")
+        return False
+
+
 def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=True, scene_snap=False):
     """
     根据字幕时间戳逐段调整视频速度，匹配配音音频
@@ -452,6 +570,14 @@ def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, wo
         print(f"[INFO] RIFE GPU 插帧已就绪 (PyTorch + CUDA)")
     else:
         print("[INFO] RIFE 模块不可用, 减速段将使用 setpts 兜底")
+
+    # ── 快速路径：无 RIFE 时用单命令 ffmpeg 处理全部段 ──
+    if not _rife_available:
+        result = _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch, scene_snap)
+        if result is not None:
+            return result
+
+    # ── 慢速路径：逐段子进程处理（RIFE 段需要）──
 
     # P1-2: 场景边界检测（如启用）
     scene_times = []
