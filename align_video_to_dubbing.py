@@ -155,7 +155,7 @@ def cut_video_segment(video_path, start, end, output_path, fast=False):
             '-i', str(video_path),              # -i 在 -ss 之前 = 帧精确切割
             '-ss', str(start),                  # 输入 seek 到精确时间
             '-t', str(duration),
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
             '-an',
             str(output_path)
         ]
@@ -167,7 +167,7 @@ def _setpts_adjust(video_segment, speed_ratio, output_path):
         'ffmpeg', '-y', '-i', str(video_segment),
         '-vf', f'setpts={speed_ratio}*PTS',
         '-an',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
         str(output_path)
     ]
     subprocess.run(cmd, capture_output=True)
@@ -178,11 +178,11 @@ def _cut_and_adjust_segment(video_path, start, end, speed_ratio, output_path):
     if 0.85 <= speed_ratio <= 1.15:
         cmd = [
             'ffmpeg', '-y',
-            '-i', str(video_path),
-            '-ss', str(start), '-t', str(duration),
+            '-ss', str(start),
+            '-i', str(video_path), '-t', str(duration),
             '-vf', f'setpts={speed_ratio}*PTS',
             '-an',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
             str(output_path)
         ]
         subprocess.run(cmd, capture_output=True)
@@ -190,13 +190,13 @@ def _cut_and_adjust_segment(video_path, start, end, speed_ratio, output_path):
     elif speed_ratio < 0.85:
         cmd = [
             'ffmpeg', '-y',
-            '-i', str(video_path),
-            '-ss', str(start), '-t', str(duration),
+            '-ss', str(start),
+            '-i', str(video_path), '-t', str(duration),
             '-vf',
             f'setpts={speed_ratio}*PTS,'
             f'framerate=fps=30:interp_start=0:interp_end=100:scene=100',
             '-an',
-            '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+            '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
             str(output_path)
         ]
         subprocess.run(cmd, capture_output=True)
@@ -228,7 +228,7 @@ def _framerate_speedup(video_segment, speed_ratio, output_path):
         f'setpts={speed_ratio}*PTS,'
         f'framerate=fps=30:interp_start=0:interp_end=100:scene=100',
         '-an',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
         str(output_path)
     ]
     subprocess.run(cmd, capture_output=True)
@@ -274,7 +274,7 @@ def create_silence_video(duration, width, height, fps, output_path):
         'ffmpeg', '-y', '-f', 'lavfi', '-i',
         f'color=c=black:s={width}x{height}:r={fps}',
         '-t', str(duration),
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+        '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18',
         str(output_path)
     ]
     subprocess.run(cmd, capture_output=True)
@@ -367,7 +367,7 @@ def _process_one_segment(args):
         if 0.95 <= speed_ratio <= 1.05:
             # Near-1.0: fast cut (gap segments etc, re-encode to h264 for concat compatibility)
             subprocess.run(['ffmpeg', '-y', '-ss', str(start), '-i', str(video_path),
-                '-t', str(end-start), '-c:v', 'libx264', '-preset', 'fast', '-crf', '18', '-an',
+                '-t', str(end-start), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-an',
                 str(adjusted_video)], capture_output=True)
             method = "copy"
         elif speed_ratio > 1.15 and _rife_available and rife_slowdown is not None:
@@ -617,7 +617,8 @@ def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, wo
                 ("copy", method_counts.get("copy", 0) + method_counts.get("bi-copy", 0)),
                 ("framerate", method_counts.get("framerate", 0) + method_counts.get("bi-framerate", 0))
             ])
-            print(f"\r  完成: {done_count}/{total_segments} | {counts_str} | ~{avg_time:.1f}s/段", end="", flush=True)
+            remaining = avg_time * (total_segments - done_count)
+            print(f"\r  完成: {done_count}/{total_segments} | {elapsed:.0f}s [{avg_time:.1f}s/段] 剩余{remaining:.0f}s | {counts_str}", end="", flush=True)
 
     # Phase 1: 非 RIFE 段并行处理
     if non_rife_tasks:
@@ -655,24 +656,22 @@ def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, wo
             return False
         adjusted_segments.append(str(final_segment))
 
-    # 6. 合并所有段（用 Python 直接串接，跳过 concat demuxer）
+    # 6. 合并所有段（统一 h264，concat -c copy 无重编码）
     print(f"[WORK] 策略统计: {', '.join(f'{k}={v}' for k,v in sorted(method_counts.items()) if v>0)}")
     print("[WORK] 合并所有调整后的片段...")
 
-    # 方式: 所有段作为 ffmpeg 多输入，concat 滤镜合并
-    inputs = []
-    for seg in adjusted_segments:
-        inputs.extend(['-i', seg])
-    
-    n = len(adjusted_segments)
-    filter_parts = ''.join(f'[{i}:v][{i}:a]' for i in range(n))
-    filter_graph = f'{filter_parts}concat=n={n}:v=1:a=1[outv][outa]'
-    
-    concat_cmd = ['ffmpeg', '-y'] + inputs + [
-        '-filter_complex', filter_graph,
-        '-map', '[outv]', '-map', '[outa]',
-        '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
+    concat_path = segments_dir / "concat.txt"
+    with open(concat_path, 'w', encoding='utf-8') as f:
+        for segment in adjusted_segments:
+            abs_path = str(Path(segment).resolve()).replace(chr(92), '/')
+            f.write(f"file '{abs_path}'\n")
+
+    concat_cmd = ['ffmpeg', '-y', '-fflags', '+genpts',
+        '-f', 'concat', '-safe', '0',
+        '-i', str(concat_path),
+        '-c:v', 'copy',
         '-c:a', 'aac', '-b:a', '192k', '-ar', '16000',
+        '-vsync', '2',
         str(output_path)
     ]
     result = subprocess.run(concat_cmd, capture_output=True, text=True)
@@ -728,8 +727,12 @@ if __name__ == "__main__":
     parser.add_argument("--audio-stretch", action="store_true", default=True, help="小范围内拉伸音频而非调整视频速度 (默认启用)")
     parser.add_argument("--no-audio-stretch", dest="audio_stretch", action="store_false", help="禁用音频拉伸")
     parser.add_argument("--scene-snap", action="store_true", default=False, help="将片段切点吸附到场景切换边界")
+    parser.add_argument("--no-rife", action="store_true", default=False, help="禁用 RIFE GPU 插帧，全部用 setpts 替代")
 
     args = parser.parse_args()
+
+    if args.no_rife:
+        _rife_available = False
 
     process_video_with_dubbing(
         args.srt,
@@ -775,6 +778,9 @@ def main():
 
     if "--scene-snap" in sys.argv:
         scene_snap = True
+
+    if "--no-rife" in sys.argv:
+        globals()['_rife_available'] = False
 
     process_video_with_dubbing(
         srt_path, video_path, dubbed_dir, output_path,
