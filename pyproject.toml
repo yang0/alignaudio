@@ -29,9 +29,7 @@ dependencies = [
 dev = ["tqdm", "sk-video", "moviepy", "torchvision"]
 
 [project.scripts]
-align-video  = "align_video_to_dubbing:main"
-align-audio  = "align_dubbed_audio:main"
-adjust-subs  = "adjust_subtitle_timestamps:main"
+align-video = "align_video_to_dubbing:main"
 
 [tool.setuptools]
 py-modules = [

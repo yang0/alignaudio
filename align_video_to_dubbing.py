@@ -449,13 +449,58 @@ def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=
         dubbed_files = dubbed_files[:min_count]
 
     n = len(timestamps)
+
+    # 如果段数多（>60），分批处理避免命令行超限
+    MAX_SEGS_PER_BATCH = 30
+    batch_count = max(1, (len(dubbed_files) + MAX_SEGS_PER_BATCH - 1) // MAX_SEGS_PER_BATCH)
+    if batch_count > 1:
+        print(f"[INFO] {n} 段字幕分 {batch_count} 批处理 (每批 ≤{MAX_SEGS_PER_BATCH} 段)")
+
+        batch_outputs = []
+        batch_dir = Path(str(output_path) + ".batches")
+        batch_dir.mkdir(exist_ok=True)
+
+        for bi in range(batch_count):
+            si = bi * MAX_SEGS_PER_BATCH
+            ei = min(si + MAX_SEGS_PER_BATCH, n)
+            batch_out = batch_dir / f"batch_{bi:04d}.mp4"
+
+            batch_timestamps = timestamps[si:ei]
+            batch_wavs = dubbed_files[si:ei]
+
+            if not _run_single_batch(batch_timestamps, batch_wavs, video_path, str(batch_out)):
+                return False
+            batch_outputs.append(str(batch_out))
+
+        # 用 concat demuxer 合并批次
+        concat_list = batch_dir / "concat.txt"
+        with open(concat_list, 'w') as f:
+            for p in batch_outputs:
+                f.write(f"file '{Path(p).resolve()}'\n")
+        subprocess.run(['ffmpeg', '-y', '-f', 'concat', '-safe', '0', '-i', str(concat_list),
+                        '-c', 'copy', str(output_path)], capture_output=True)
+        shutil.rmtree(batch_dir, ignore_errors=True)
+
+        output_info = get_video_info(output_path)
+        print(f"[OK] 分批完成 ({batch_count} 批)")
+        if output_info:
+            print(f"   输出时长: {output_info['duration']:.2f}秒")
+        return True
+
+    # 单批直接处理
+    return _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch, scene_snap)
+
+
+def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=True, scene_snap=False, scene_times=None):
+    """处理一批段（单 ffmpeg 命令），返回 True/False"""
+    n = len(timestamps)
     print(f"[INFO] {n} 段字幕, 单命令处理")
 
     # 场景吸附（可选）
-    scene_times = []
-    if scene_snap:
+    _scene_times = scene_times if scene_times is not None else []
+    if scene_snap and not _scene_times:
         print("[INFO] 场景吸附检测中...")
-        scene_times = detect_scene_changes(video_path)
+        _scene_times = detect_scene_changes(video_path)
 
     # ── 预计算所有段的参数 ──
     segment_params = []  # list of (start, end, v_ratio, a_ratio, audio_path)
@@ -827,33 +872,47 @@ if __name__ == "__main__":
     import argparse
 
     parser = argparse.ArgumentParser(
-        description="视频配音对齐工具 (混合策略版 + 并行处理)",
+        description="视频配音对齐 — 将配音音频逐段对齐到原始视频，自动调整速度匹配时长",
         formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""速度调整策略:
-  |ratio-1| <= 0.10 → 纯音频拉伸 (视频原画质)
-  > 0.10           → 双向分担 (音频+视频各调一半)
-  > 1.15           → RIFE GPU 运动插帧 (减速, 串行GPU处理)
-               └ 不可用时 setpts 兜底
-  < 0.85           → framerate 混合帧 (加速)
+        epilog="""速度策略:
+  |ratio-1| <= 0.20   → 纯音频拉伸 (视频零损耗, rubberband)
+  > 0.20              → 双向分担 (音频+视频各自 sqrt(ratio))
+                         减速用 RIFE GPU 插帧, 加速用 framerate
 
-调度策略:
-  非RIFE段 → 多线程并行 (workers)
-  RIFE段   → GPU串行 (避免显存争抢)
+调度:
+  无RIFE时  → 单 ffmpeg 命令一次性处理 (最快)
+  有RIFE时  → 多线程并行非RIFE段 + GPU串行RIFE段
 
 示例:
-  python align_video_to_dubbing.py test/video_zh.srt test/video_no_audio.mp4 test/dubbed_output test/final_output.mp4 --workers 4
+  # 快速模式 (推荐, --no-rife)
+  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --no-rife
+
+  # 高质量模式 (需 RIFE GPU)
+  align-video video_zh.srt video.mp4 dubbing/ output.mp4
+
+  # 大批量 + 断点续跑
+  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --no-rife --resume
+
+目录结构:
+  dubbing/            ← 配音片段目录
+    0001.wav             (第1段配音)
+    0002.wav             (第2段配音)
+    ...
+  video_zh.srt        ← 字幕文件 (提供时间轴)
+  video.mp4           ← 原始视频 (无音轨)
 """
     )
     parser.add_argument("srt", help="字幕文件路径 (.srt)")
-    parser.add_argument("video", help="原始视频路径 (无音频)")
-    parser.add_argument("dubbed_dir", help="配音片段目录 (0001.wav, 0002.wav, ...)")
-    parser.add_argument("output", help="最终输出路径 (.mp4)")
-    parser.add_argument("--workers", type=int, default=4, help="并行处理线程数 (默认 4)")
-    parser.add_argument("--resume", action="store_true", help="从检查点恢复")
-    parser.add_argument("--audio-stretch", action="store_true", default=True, help="小范围内拉伸音频而非调整视频速度 (默认启用)")
-    parser.add_argument("--no-audio-stretch", dest="audio_stretch", action="store_false", help="禁用音频拉伸")
-    parser.add_argument("--scene-snap", action="store_true", default=False, help="将片段切点吸附到场景切换边界")
-    parser.add_argument("--no-rife", action="store_true", default=False, help="禁用 RIFE GPU 插帧，全部用 setpts 替代")
+    parser.add_argument("video", help="原始视频路径 (无音轨 .mp4)")
+    parser.add_argument("dubbed_dir", help="配音片段目录 (含 0001.wav 0002.wav ...)")
+    parser.add_argument("output", help="输出视频路径 (.mp4)")
+    parser.add_argument("--workers", type=int, default=4, help="并行线程数 (默认4)")
+    parser.add_argument("--resume", action="store_true", help="从 checkpoint 断点续跑")
+    parser.add_argument("--no-audio-stretch", dest="audio_stretch", action="store_false",
+                        help="禁用音频拉伸 (纯视频调整)")
+    parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
+    parser.add_argument("--no-rife", action="store_true",
+                        help="禁用 RIFE GPU 插帧, 用 setpts 替代 (更快)")
 
     args = parser.parse_args()
 
@@ -872,44 +931,37 @@ if __name__ == "__main__":
     )
 
 def main():
-    import sys
-    if len(sys.argv) < 5:
-        print("用法: align-video <字幕.srt> <视频.mp4> <配音目录> <输出.mp4>")
-        print("      align-video test/video_zh.srt test/video_no_audio.mp4 test/dubbed_output test/output.mp4")
-        sys.exit(1)
+    """CLI 入口 — uv tool install 后可直接 align-video 调用"""
+    import sys, argparse
 
-    # 解析位置参数
-    srt_path = sys.argv[1]
-    video_path = sys.argv[2]
-    dubbed_dir = sys.argv[3]
-    output_path = sys.argv[4]
+    parser = argparse.ArgumentParser(
+        description="视频配音对齐 — 将配音音频逐段对齐到原始视频",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog="""示例:
+  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --no-rife
+  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --no-rife --resume
 
-    workers = 4
-    resume = False
-    audio_stretch = True
-    scene_snap = False
+更多: align-video -h"""
+    )
+    parser.add_argument("srt", help="字幕文件 (.srt)")
+    parser.add_argument("video", help="原始视频 (无音轨 .mp4)")
+    parser.add_argument("dubbed_dir", help="配音片段目录 (含 0001.wav 0002.wav ...)")
+    parser.add_argument("output", help="输出视频 (.mp4)")
+    parser.add_argument("--workers", type=int, default=4, help="并行线程数 (默认4)")
+    parser.add_argument("--resume", action="store_true", help="断点续跑")
+    parser.add_argument("--no-audio-stretch", dest="audio_stretch", action="store_false",
+                        help="禁用音频拉伸")
+    parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
+    parser.add_argument("--no-rife", action="store_true", help="禁用 RIFE, 用 setpts (更快)")
 
-    if "--workers" in sys.argv:
-        idx = sys.argv.index("--workers")
-        if idx + 1 < len(sys.argv):
-            workers = int(sys.argv[idx + 1])
+    args = parser.parse_args(sys.argv[1:]) if len(sys.argv) > 1 else parser.parse_args(['-h'])
 
-    if "--resume" in sys.argv:
-        resume = True
-
-    if "--no-audio-stretch" in sys.argv:
-        audio_stretch = False
-    if "--audio-stretch" in sys.argv:
-        audio_stretch = True
-
-    if "--scene-snap" in sys.argv:
-        scene_snap = True
-
-    if "--no-rife" in sys.argv:
+    if args.no_rife:
         globals()['_rife_available'] = False
 
     process_video_with_dubbing(
-        srt_path, video_path, dubbed_dir, output_path,
-        workers=workers, resume=resume,
-        audio_stretch=audio_stretch, scene_snap=scene_snap
+        args.srt, args.video, args.dubbed_dir, args.output,
+        workers=args.workers, resume=args.resume,
+        audio_stretch=args.audio_stretch,
+        scene_snap=args.scene_snap
     )
