@@ -884,14 +884,14 @@ if __name__ == "__main__":
   有RIFE时  → 多线程并行非RIFE段 + GPU串行RIFE段
 
 示例:
-  # 快速模式 (推荐, --no-rife)
-  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --no-rife
-
-  # 高质量模式 (需 RIFE GPU)
+  # 默认模式 (快速, 无 RIFE)
   align-video video_zh.srt video.mp4 dubbing/ output.mp4
 
+  # 高质量模式 (需 RIFE GPU)
+  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --rife
+
   # 大批量 + 断点续跑
-  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --no-rife --resume
+  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --resume
 
 目录结构:
   dubbing/            ← 配音片段目录
@@ -911,13 +911,12 @@ if __name__ == "__main__":
     parser.add_argument("--no-audio-stretch", dest="audio_stretch", action="store_false",
                         help="禁用音频拉伸 (纯视频调整)")
     parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
-    parser.add_argument("--no-rife", action="store_true",
-                        help="禁用 RIFE GPU 插帧, 用 setpts 替代 (更快)")
+    parser.add_argument("--rife", action="store_true",
+                        help="启用 RIFE GPU 运动插帧 (默认关闭)")
 
     args = parser.parse_args()
 
-    if args.no_rife:
-        _rife_available = False
+    _rife_available = args.rife
 
     process_video_with_dubbing(
         args.srt,
@@ -938,8 +937,9 @@ def main():
         description="视频配音对齐 — 将配音音频逐段对齐到原始视频",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""示例:
-  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --no-rife
-  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --no-rife --resume
+  align-video video_zh.srt video.mp4 dubbing/ output.mp4
+  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --rife
+  align-video video_zh.srt video.mp4 dubbing/ output.mp4 --resume
 
 更多: align-video -h"""
     )
@@ -952,12 +952,11 @@ def main():
     parser.add_argument("--no-audio-stretch", dest="audio_stretch", action="store_false",
                         help="禁用音频拉伸")
     parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
-    parser.add_argument("--no-rife", action="store_true", help="禁用 RIFE, 用 setpts (更快)")
+    parser.add_argument("--rife", action="store_true", help="启用 RIFE GPU 插帧 (默认关闭)")
 
     args = parser.parse_args(sys.argv[1:]) if len(sys.argv) > 1 else parser.parse_args(['-h'])
 
-    if args.no_rife:
-        globals()['_rife_available'] = False
+    globals()['_rife_available'] = args.rife
 
     process_video_with_dubbing(
         args.srt, args.video, args.dubbed_dir, args.output,
