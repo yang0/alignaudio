@@ -433,7 +433,7 @@ def _process_one_segment(args):
     return (i, f"bi-{vid_method}", str(final_segment))
 
 
-def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=True):
+def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=False):
     """
     单命令 ffmpeg 快速管道：所有非 RIFE 段在一个 filter_complex 中处理。
     速度：1 个 ffmpeg 进程 vs 630 个子进程。
@@ -491,7 +491,7 @@ def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=
     return _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch, scene_snap, adaptive_speed)
 
 
-def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=True, scene_times=None):
+def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=False, scene_times=None):
     """处理一批段（单 ffmpeg 命令），返回 True/False"""
     n = len(timestamps)
     print(f"[INFO] {n} 段字幕, 单命令处理")
@@ -665,7 +665,7 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
         return False
 
 
-def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=False, scene_snap=False, adaptive_speed=True):
+def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=False, scene_snap=False, adaptive_speed=False):
     """
     根据字幕时间戳逐段调整视频速度，匹配配音音频
 
@@ -979,8 +979,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="从 checkpoint 断点续跑")
     parser.add_argument("--audio-stretch", dest="audio_stretch", action="store_true",
                         help="启用音频拉伸 (旧模式)")
-    parser.add_argument("--no-adaptive-speed", dest="adaptive_speed", action="store_false", default=True,
-                        help="禁用两级变速对齐 (默认开启：全局+局部双调)")
+    parser.add_argument("--adaptive-speed", dest="adaptive_speed", action="store_true", default=False,
+                        help="启用两级变速对齐 (全局+局部双调)")
     parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
     parser.add_argument("--rife", action="store_true",
                         help="启用 RIFE GPU 运动插帧 (默认关闭)")
