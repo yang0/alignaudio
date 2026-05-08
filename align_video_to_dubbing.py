@@ -433,7 +433,7 @@ def _process_one_segment(args):
     return (i, f"bi-{vid_method}", str(final_segment))
 
 
-def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=False, scene_snap=False):
+def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=True):
     """
     单命令 ffmpeg 快速管道：所有非 RIFE 段在一个 filter_complex 中处理。
     速度：1 个 ffmpeg 进程 vs 630 个子进程。
@@ -488,10 +488,10 @@ def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=
         return True
 
     # 单批直接处理
-    return _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch, scene_snap)
+    return _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch, scene_snap, adaptive_speed)
 
 
-def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=False, scene_snap=False, scene_times=None):
+def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=True, scene_times=None):
     """处理一批段（单 ffmpeg 命令），返回 True/False"""
     n = len(timestamps)
     print(f"[INFO] {n} 段字幕, 单命令处理")
@@ -505,6 +505,14 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
     # ── 预计算所有段的参数 ──
     # 统一格式: (start, effective_end, v_ratio, a_tempo, audio_path, next_start)
     segment_params = []
+    
+    # 两级变速对齐（全局+局部，防止极端变速）
+    if adaptive_speed:
+        total_desired = sum(end - start for (start, end), _ in zip(timestamps, dubbed_files))
+        total_actual = sum(get_audio_duration(w) for _, w in zip(timestamps, dubbed_files))
+        base_factor = max(0.8, min(1.2, total_desired / max(total_actual, 0.001) * 0.99))
+        print(f"[INFO] 两级变速: base={base_factor:.3f} (总目标={total_desired:.1f}s, 实际={total_actual:.1f}s)")
+    
     for i, ((start, end), wav) in enumerate(zip(timestamps, dubbed_files)):
         if scene_snap and scene_times:
             start = snap_to_scene(start, scene_times)
@@ -516,6 +524,18 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
 
         vid_dur = end - start
         aud_dur = get_audio_duration(wav)
+        
+        if adaptive_speed:
+            # 两级变速：base * local，双限制防止音质劣化
+            local = max(0.9, min(1.1, vid_dur / max(aud_dur * base_factor, 0.001)))
+            a_tempo = base_factor * local
+            effective_end = end
+            v_ratio = 1.0
+            pad_dur = 0.0
+            if next_start is not None and effective_end > next_start:
+                effective_end = next_start
+            segment_params.append((start, effective_end, v_ratio, a_tempo, wav, next_start, pad_dur))
+            continue
 
         if audio_stretch:
             ratio = aud_dur / vid_dur
@@ -645,7 +665,7 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
         return False
 
 
-def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=False, scene_snap=False):
+def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=False, scene_snap=False, adaptive_speed=True):
     """
     根据字幕时间戳逐段调整视频速度，匹配配音音频
 
@@ -667,7 +687,7 @@ def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, wo
 
     # ── 快速路径：无 RIFE 时用单命令 ffmpeg 处理全部段 ──
     if not _rife_available:
-        result = _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch, scene_snap)
+        result = _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch, scene_snap, adaptive_speed)
         if result is not None:
             return result
 
@@ -959,6 +979,8 @@ if __name__ == "__main__":
     parser.add_argument("--resume", action="store_true", help="从 checkpoint 断点续跑")
     parser.add_argument("--audio-stretch", dest="audio_stretch", action="store_true",
                         help="启用音频拉伸 (旧模式)")
+    parser.add_argument("--no-adaptive-speed", dest="adaptive_speed", action="store_false", default=True,
+                        help="禁用两级变速对齐 (默认开启：全局+局部双调)")
     parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
     parser.add_argument("--rife", action="store_true",
                         help="启用 RIFE GPU 运动插帧 (默认关闭)")
@@ -975,7 +997,8 @@ if __name__ == "__main__":
         workers=args.workers,
         resume=args.resume,
         audio_stretch=args.audio_stretch,
-        scene_snap=args.scene_snap
+        scene_snap=args.scene_snap,
+        adaptive_speed=args.adaptive_speed
     )
 
 def main():
@@ -1000,6 +1023,8 @@ def main():
     parser.add_argument("--resume", action="store_true", help="断点续跑")
     parser.add_argument("--audio-stretch", dest="audio_stretch", action="store_true",
                         help="启用音频拉伸 (视频优先模式)")
+    parser.add_argument("--no-adaptive-speed", dest="adaptive_speed", action="store_false", default=True,
+                        help="禁用两级变速对齐")
     parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
     parser.add_argument("--rife", action="store_true", help="启用 RIFE GPU 插帧 (默认关闭)")
 
@@ -1011,5 +1036,6 @@ def main():
         args.srt, args.video, args.dubbed_dir, args.output,
         workers=args.workers, resume=args.resume,
         audio_stretch=args.audio_stretch,
-        scene_snap=args.scene_snap
+        scene_snap=args.scene_snap,
+        adaptive_speed=args.adaptive_speed
     )
