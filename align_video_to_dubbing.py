@@ -433,7 +433,7 @@ def _process_one_segment(args):
     return (i, f"bi-{vid_method}", str(final_segment))
 
 
-def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=True, scene_snap=False):
+def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=False, scene_snap=False):
     """
     单命令 ffmpeg 快速管道：所有非 RIFE 段在一个 filter_complex 中处理。
     速度：1 个 ffmpeg 进程 vs 630 个子进程。
@@ -491,7 +491,7 @@ def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=
     return _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch, scene_snap)
 
 
-def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=True, scene_snap=False, scene_times=None):
+def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=False, scene_snap=False, scene_times=None):
     """处理一批段（单 ffmpeg 命令），返回 True/False"""
     n = len(timestamps)
     print(f"[INFO] {n} 段字幕, 单命令处理")
@@ -503,19 +503,54 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
         _scene_times = detect_scene_changes(video_path)
 
     # ── 预计算所有段的参数 ──
-    segment_params = []  # list of (start, end, v_ratio, a_ratio, audio_path)
+    # 统一格式: (start, effective_end, v_ratio, a_tempo, audio_path, next_start)
+    segment_params = []
     for i, ((start, end), wav) in enumerate(zip(timestamps, dubbed_files)):
         if scene_snap and scene_times:
             start = snap_to_scene(start, scene_times)
             end = snap_to_scene(end, scene_times)
+
+        next_start = timestamps[i + 1][0] if i + 1 < len(timestamps) else None
+        if scene_snap and scene_times and next_start is not None:
+            next_start = snap_to_scene(next_start, scene_times)
+
         vid_dur = end - start
         aud_dur = get_audio_duration(wav)
-        ratio = aud_dur / vid_dur
-        if audio_stretch and abs(ratio - 1) <= 0.20:
-            segment_params.append((start, end, 1.0, ratio, wav))
+
+        if audio_stretch:
+            ratio = aud_dur / vid_dur
+            if abs(ratio - 1) <= 0.20:
+                segment_params.append((start, end, 1.0, ratio, wav, next_start))
+            else:
+                split = ratio ** 0.5
+                segment_params.append((start, end, split, split, wav, next_start))
         else:
-            split = ratio ** 0.5
-            segment_params.append((start, end, split, split, wav))
+            # 音频优先策略
+            gap_after = (next_start - end) if next_start is not None else 0.0
+            extra = aud_dur - vid_dur
+
+            if extra <= 0:
+                effective_end = end
+                v_ratio = 1.0
+                a_tempo = 1.0
+            elif extra <= gap_after:
+                effective_end = end + extra
+                v_ratio = 1.0
+                a_tempo = 1.0
+            elif aud_dur / (vid_dur + gap_after) <= 1.15:
+                effective_end = end + gap_after
+                v_ratio = 1.0
+                a_tempo = aud_dur / (vid_dur + gap_after)
+            else:
+                a_tempo = 1.15
+                compressed_audio = aud_dur / 1.15
+                v_ratio = compressed_audio / vid_dur
+                effective_end = end
+
+            if next_start is not None and effective_end > next_start:
+                effective_end = next_start
+
+            segment_params.append((start, effective_end, v_ratio, a_tempo, wav, next_start))
 
     # ── 构建 filter_complex ──
     video_input = str(Path(video_path).resolve())
@@ -524,25 +559,27 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
     concat_labels = []
     seg_idx = 0
 
-    for idx, (s, e, vr, ar, wav) in enumerate(segment_params):
+    for idx, (s, e, vr, ar, wav, next_start) in enumerate(segment_params):
         audio_inputs.append(str(Path(wav).resolve()))
         in_audio = idx + 1
 
         vl = f'v{seg_idx}'
         al = f'a{seg_idx}'
         filters.append(f"[0:v]trim=start={s}:end={e},setpts=(PTS-STARTPTS)*{vr}[{vl}]")
-        filters.append(f"[{in_audio}:a]rubberband=tempo={ar}[{al}]")
+        if abs(ar - 1.0) < 0.001:
+            filters.append(f"[{in_audio}:a]anull[{al}]")
+        else:
+            filters.append(f"[{in_audio}:a]rubberband=tempo={ar}[{al}]")
         concat_labels.extend([f"[{vl}]", f"[{al}]"])
         seg_idx += 1
 
-        # 间隙段
-        if idx + 1 < len(segment_params):
-            next_s = segment_params[idx + 1][0]
-            gap = next_s - e
+        # 间隙段（仅在有效结束点小于下一段开始时才插入）
+        if next_start is not None:
+            gap = next_start - e
             if gap > 0.01:
                 vl = f'v{seg_idx}'
                 al = f'a{seg_idx}'
-                filters.append(f"[0:v]trim=start={e}:end={next_s},setpts=PTS-STARTPTS[{vl}]")
+                filters.append(f"[0:v]trim=start={e}:end={next_start},setpts=PTS-STARTPTS[{vl}]")
                 filters.append(f"aevalsrc=0.0:d={gap}:sample_rate=16000[{al}]")
                 concat_labels.extend([f"[{vl}]", f"[{al}]"])
                 seg_idx += 1
@@ -596,7 +633,7 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
         return False
 
 
-def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=True, scene_snap=False):
+def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=False, scene_snap=False):
     """
     根据字幕时间戳逐段调整视频速度，匹配配音音频
 
@@ -908,8 +945,8 @@ if __name__ == "__main__":
     parser.add_argument("output", help="输出视频路径 (.mp4)")
     parser.add_argument("--workers", type=int, default=4, help="并行线程数 (默认4)")
     parser.add_argument("--resume", action="store_true", help="从 checkpoint 断点续跑")
-    parser.add_argument("--no-audio-stretch", dest="audio_stretch", action="store_false",
-                        help="禁用音频拉伸 (纯视频调整)")
+    parser.add_argument("--audio-stretch", dest="audio_stretch", action="store_true",
+                        help="启用音频拉伸 (旧模式)")
     parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
     parser.add_argument("--rife", action="store_true",
                         help="启用 RIFE GPU 运动插帧 (默认关闭)")
@@ -949,8 +986,8 @@ def main():
     parser.add_argument("output", help="输出视频 (.mp4)")
     parser.add_argument("--workers", type=int, default=4, help="并行线程数 (默认4)")
     parser.add_argument("--resume", action="store_true", help="断点续跑")
-    parser.add_argument("--no-audio-stretch", dest="audio_stretch", action="store_false",
-                        help="禁用音频拉伸")
+    parser.add_argument("--audio-stretch", dest="audio_stretch", action="store_true",
+                        help="启用音频拉伸 (视频优先模式)")
     parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
     parser.add_argument("--rife", action="store_true", help="启用 RIFE GPU 插帧 (默认关闭)")
 
