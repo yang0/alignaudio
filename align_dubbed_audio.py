@@ -56,7 +56,7 @@ def stretch_audio(input_path, output_path, target_duration, original_duration):
     cmd = [
         'ffmpeg', '-y', '-i', str(input_path),
         '-af', filter_chain,
-        '-ar', '16000', '-ac', '1',
+        '-ar', '24000', '-ac', '1',
         str(output_path)
     ]
     subprocess.run(cmd, capture_output=True)
@@ -114,7 +114,7 @@ def align_dubbed_audio(srt_path, dubbed_dir, output_path):
                 cmd = [
                     'ffmpeg', '-y', '-i', str(dubbed_file),
                     '-af', f'rubberband=tempo={1/speed_ratio:.4f}',
-                    '-ar', '16000', '-ac', '1',
+                    '-ar', '24000', '-ac', '1',
                     str(adjusted_file)
                 ]
                 result = subprocess.run(cmd, capture_output=True)
@@ -147,7 +147,7 @@ def align_dubbed_audio(srt_path, dubbed_dir, output_path):
                     
                     cmd = [
                         'ffmpeg', '-y', '-f', 'lavfi', '-i',
-                        f'anullsrc=r=16000:cl=mono', '-t', str(silence_duration),
+                        f'anullsrc=r=24000:cl=mono', '-t', str(silence_duration),
                         '-acodec', 'pcm_s16le', str(silence_file)
                     ]
                     subprocess.run(cmd, capture_output=True)

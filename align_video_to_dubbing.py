@@ -67,7 +67,7 @@ def stretch_audio(input_wav, output_wav, target_duration):
         [
             'ffmpeg', '-y', '-i', str(input_wav),
             '-af', f'rubberband=tempo={tempo:.4f}',
-            '-ar', '16000', '-ac', '1',
+            '-ar', '24000', '-ac', '1',
             str(output_wav)
         ],
         capture_output=True
@@ -90,7 +90,7 @@ def stretch_audio(input_wav, output_wav, target_duration):
         [
             'ffmpeg', '-y', '-i', str(input_wav),
             '-af', ','.join(filters),
-            '-ar', '16000', '-ac', '1',
+            '-ar', '24000', '-ac', '1',
             str(output_wav)
         ],
         capture_output=True
@@ -315,7 +315,7 @@ def merge_video_audio(video_path, audio_path, output_path):
         '-i', str(video_path),
         '-i', str(audio_path),
         '-c:v', 'copy',
-        '-c:a', 'aac', '-b:a', '192k', '-ar', '16000',
+        '-c:a', 'aac', '-b:a', '192k', '-ar', '24000',
         '-t', str(min_dur),
         str(output_path)
     ]
@@ -570,14 +570,18 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
         vl = f'v{seg_idx}'
         al = f'a{seg_idx}'
         filters.append(f"[0:v]trim=start={s}:end={e},setpts=(PTS-STARTPTS)*{vr}[{vl}]")
+        # 计算淡入淡出参数（50ms，极短片段自适应缩短）
+        seg_dur = (e - s) * vr
+        fade_dur = min(0.05, seg_dur / 3)
+        fade_out_st = seg_dur - fade_dur
         if abs(ar - 1.0) < 0.001:
             # 音频不拉伸，但可能需要补静音（音频比视频短）
             if pad_dur > 0.001:
-                filters.append(f"[{in_audio}:a]anull,apad=whole_dur={(e-s)*vr}[{al}]")
+                filters.append(f"[{in_audio}:a]anull,afade=t=in:d={fade_dur},afade=t=out:st={fade_out_st}:d={fade_dur},apad=whole_dur={seg_dur}[{al}]")
             else:
-                filters.append(f"[{in_audio}:a]anull[{al}]")
+                filters.append(f"[{in_audio}:a]afade=t=in:d={fade_dur},afade=t=out:st={fade_out_st}:d={fade_dur}[{al}]")
         else:
-            filters.append(f"[{in_audio}:a]rubberband=tempo={ar}[{al}]")
+            filters.append(f"[{in_audio}:a]rubberband=tempo={ar},afade=t=in:d={fade_dur},afade=t=out:st={fade_out_st}:d={fade_dur}[{al}]")
         concat_labels.extend([f"[{vl}]", f"[{al}]"])
         seg_idx += 1
 
@@ -588,7 +592,7 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
                 vl = f'v{seg_idx}'
                 al = f'a{seg_idx}'
                 filters.append(f"[0:v]trim=start={e}:end={next_start},setpts=PTS-STARTPTS[{vl}]")
-                filters.append(f"aevalsrc=0.0:d={gap}:sample_rate=16000[{al}]")
+                filters.append(f"aevalsrc=0.0:d={gap}:sample_rate=24000[{al}]")
                 concat_labels.extend([f"[{vl}]", f"[{al}]"])
                 seg_idx += 1
 
@@ -606,7 +610,7 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
             '-filter_complex', filter_graph,
             '-map', '[outv]', '-map', '[outa]',
             '-c:v', 'libx264', '-preset', 'fast', '-crf', '18',
-            '-c:a', 'aac', '-b:a', '192k', '-ar', '16000',
+            '-c:a', 'aac', '-b:a', '192k', '-ar', '24000',
             str(Path(output_path).resolve())
         ])
     else:
@@ -886,7 +890,7 @@ def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, wo
         '-f', 'concat', '-safe', '0',
         '-i', str(concat_path),
         '-c:v', 'copy',
-        '-c:a', 'aac', '-b:a', '192k', '-ar', '16000',
+        '-c:a', 'aac', '-b:a', '192k', '-ar', '24000',
         '-vsync', '2',
         str(output_path)
     ]
