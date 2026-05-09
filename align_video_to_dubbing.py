@@ -550,10 +550,11 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
             extra = aud_dur - vid_dur
 
             if extra <= 0:
-                effective_end = end
-                v_ratio = 1.0
+                # 音频比视频短 → 加速视频匹配音频
+                effective_end = start + aud_dur
+                v_ratio = aud_dur / vid_dur
                 a_tempo = 1.0
-                pad_dur = -extra  # 音频比视频短，需补静音
+                pad_dur = 0.0
             elif extra <= gap_after:
                 effective_end = end + extra
                 v_ratio = 1.0
