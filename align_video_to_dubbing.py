@@ -1023,8 +1023,8 @@ def main():
     parser.add_argument("--resume", action="store_true", help="断点续跑")
     parser.add_argument("--audio-stretch", dest="audio_stretch", action="store_true",
                         help="启用音频拉伸 (视频优先模式)")
-    parser.add_argument("--no-adaptive-speed", dest="adaptive_speed", action="store_false", default=True,
-                        help="禁用两级变速对齐")
+    parser.add_argument("--adaptive-speed", dest="adaptive_speed", action="store_true", default=False,
+                        help="启用两级变速对齐")
     parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
     parser.add_argument("--rife", action="store_true", help="启用 RIFE GPU 插帧 (默认关闭)")
 

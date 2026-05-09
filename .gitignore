@@ -21,3 +21,5 @@ ECCV2022-RIFE/
 # OS
 .DS_Store
 Thumbs.db
+
+/test2/
