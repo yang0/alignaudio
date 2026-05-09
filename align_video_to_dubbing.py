@@ -433,7 +433,7 @@ def _process_one_segment(args):
     return (i, f"bi-{vid_method}", str(final_segment))
 
 
-def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=False):
+def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=False, short_mode="apad"):
     """
     单命令 ffmpeg 快速管道：所有非 RIFE 段在一个 filter_complex 中处理。
     速度：1 个 ffmpeg 进程 vs 630 个子进程。
@@ -468,7 +468,7 @@ def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=
             batch_timestamps = timestamps[si:ei]
             batch_wavs = dubbed_files[si:ei]
 
-            if not _run_single_batch(batch_timestamps, batch_wavs, video_path, str(batch_out)):
+            if not _run_single_batch(batch_timestamps, batch_wavs, video_path, str(batch_out), short_mode=short_mode):
                 return False
             batch_outputs.append(str(batch_out))
 
@@ -488,10 +488,10 @@ def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=
         return True
 
     # 单批直接处理
-    return _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch, scene_snap, adaptive_speed)
+    return _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch, scene_snap, adaptive_speed, short_mode=short_mode)
 
 
-def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=False, scene_times=None):
+def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=False, scene_times=None, short_mode="apad"):
     """处理一批段（单 ffmpeg 命令），返回 True/False"""
     n = len(timestamps)
     print(f"[INFO] {n} 段字幕, 单命令处理")
@@ -670,7 +670,7 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
         return False
 
 
-def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=False, scene_snap=False, adaptive_speed=False):
+def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=False, scene_snap=False, adaptive_speed=False, short_mode="apad"):
     """
     根据字幕时间戳逐段调整视频速度，匹配配音音频
 
@@ -692,7 +692,7 @@ def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, wo
 
     # ── 快速路径：无 RIFE 时用单命令 ffmpeg 处理全部段 ──
     if not _rife_available:
-        result = _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch, scene_snap, adaptive_speed)
+        result = _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch, scene_snap, adaptive_speed, short_mode=short_mode)
         if result is not None:
             return result
 
@@ -989,6 +989,8 @@ if __name__ == "__main__":
     parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
     parser.add_argument("--rife", action="store_true",
                         help="启用 RIFE GPU 运动插帧 (默认关闭)")
+    parser.add_argument("--short-mode", choices=["apad", "speedup", "trim"], default="apad",
+                        help="短音频处理: apad(补静音) speedup(加速视频) trim(切多余帧)")
 
     args = parser.parse_args()
 
@@ -1003,7 +1005,8 @@ if __name__ == "__main__":
         resume=args.resume,
         audio_stretch=args.audio_stretch,
         scene_snap=args.scene_snap,
-        adaptive_speed=args.adaptive_speed
+        adaptive_speed=args.adaptive_speed,
+        short_mode=args.short_mode
     )
 
 def main():
@@ -1031,7 +1034,10 @@ def main():
     parser.add_argument("--adaptive-speed", dest="adaptive_speed", action="store_true", default=False,
                         help="启用两级变速对齐")
     parser.add_argument("--scene-snap", action="store_true", help="吸附切点到场景边界")
-    parser.add_argument("--rife", action="store_true", help="启用 RIFE GPU 插帧 (默认关闭)")
+    parser.add_argument("--rife", action="store_true",
+                        help="启用 RIFE GPU 插帧 (默认关闭)")
+    parser.add_argument("--short-mode", choices=["apad", "speedup", "trim"], default="apad",
+                        help="短音频处理: apad(补静音) speedup(加速视频) trim(切多余帧)")
 
     args = parser.parse_args(sys.argv[1:]) if len(sys.argv) > 1 else parser.parse_args(['-h'])
 
@@ -1042,5 +1048,6 @@ def main():
         workers=args.workers, resume=args.resume,
         audio_stretch=args.audio_stretch,
         scene_snap=args.scene_snap,
-        adaptive_speed=args.adaptive_speed
+        adaptive_speed=args.adaptive_speed,
+        short_mode=args.short_mode
     )
