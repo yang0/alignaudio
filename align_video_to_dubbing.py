@@ -433,7 +433,7 @@ def _process_one_segment(args):
     return (i, f"bi-{vid_method}", str(final_segment))
 
 
-def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=False, short_mode="apad"):
+def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=False, short_mode="trim"):
     """
     单命令 ffmpeg 快速管道：所有非 RIFE 段在一个 filter_complex 中处理。
     速度：1 个 ffmpeg 进程 vs 630 个子进程。
@@ -491,7 +491,7 @@ def _fast_pipeline(srt_path, video_path, dubbed_dir, output_path, audio_stretch=
     return _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch, scene_snap, adaptive_speed, short_mode=short_mode)
 
 
-def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=False, scene_times=None, short_mode="apad"):
+def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_stretch=False, scene_snap=False, adaptive_speed=False, scene_times=None, short_mode="trim"):
     """处理一批段（单 ffmpeg 命令），返回 True/False"""
     n = len(timestamps)
     print(f"[INFO] {n} 段字幕, 单命令处理")
@@ -550,11 +550,21 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
             extra = aud_dur - vid_dur
 
             if extra <= 0:
-                # 音频比视频短 → 正常播放，末尾补静音对齐视频
-                effective_end = end
-                v_ratio = 1.0
-                a_tempo = 1.0
-                pad_dur = -extra  # apad 补齐静音
+                if short_mode == "speedup":
+                    effective_end = end
+                    v_ratio = aud_dur / vid_dur
+                    a_tempo = 1.0
+                    pad_dur = 0.0
+                elif short_mode == "trim":
+                    effective_end = start + aud_dur
+                    v_ratio = 1.0
+                    a_tempo = 1.0
+                    pad_dur = 0.0
+                else:  # apad
+                    effective_end = end
+                    v_ratio = 1.0
+                    a_tempo = 1.0
+                    pad_dur = -extra
                 segment_end = effective_end
             elif extra <= gap_after:
                 effective_end = end + extra
@@ -581,6 +591,16 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
 
             segment_params.append((start, effective_end, v_ratio, a_tempo, wav, next_start, pad_dur, segment_end, end))
 
+    # ── 音频时间轴审计日志 ──
+    print(f"\n[AUDIT] short_mode={short_mode}, {len(segment_params)} segments:")
+    cum = 0.0
+    for idx, (s, e, vr, ar, wav, ns, pd, se, oe) in enumerate(segment_params):
+        seg_dur = (e - s) * vr if vr > 0 else 0
+        gap_val = (ns - se) if ns and short_mode != "trim" else 0.0
+        cum += seg_dur + gap_val
+        print(f"  #{idx+1:02d} SRT={s:.1f}-{e:.1f}s aud={seg_dur:.1f}s gap={gap_val:.1f}s cum={cum:.1f}s vr={vr:.2f} ar={ar:.2f} pad={pd:.1f}")
+    print()
+
     # ── 构建 filter_complex ──
     video_input = str(Path(video_path).resolve())
     audio_inputs = [video_input]  # [0] = video
@@ -602,11 +622,11 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
         if abs(ar - 1.0) < 0.001:
             # 音频不拉伸，但可能需要补静音（音频比视频短）
             if pad_dur > 0.001:
-                filters.append(f"[{in_audio}:a]anull,afade=t=in:d={fade_dur},afade=t=out:st={fade_out_st}:d={fade_dur},apad=whole_dur={seg_dur}[{al}]")
+                filters.append(f"[{in_audio}:a]anull,apad=whole_dur={seg_dur}[{al}]")
             else:
-                filters.append(f"[{in_audio}:a]afade=t=in:d={fade_dur},afade=t=out:st={fade_out_st}:d={fade_dur}[{al}]")
+                filters.append(f"[{in_audio}:a]anull[{al}]")
         else:
-            filters.append(f"[{in_audio}:a]rubberband=tempo={ar},afade=t=in:d={fade_dur},afade=t=out:st={fade_out_st}:d={fade_dur}[{al}]")
+            filters.append(f"[{in_audio}:a]rubberband=tempo={ar}[{al}]")
         concat_labels.extend([f"[{vl}]", f"[{al}]"])
         seg_idx += 1
 
@@ -671,7 +691,7 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
         return False
 
 
-def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=False, scene_snap=False, adaptive_speed=False, short_mode="apad"):
+def process_video_with_dubbing(srt_path, video_path, dubbed_dir, output_path, workers=4, resume=False, audio_stretch=False, scene_snap=False, adaptive_speed=False, short_mode="trim"):
     """
     根据字幕时间戳逐段调整视频速度，匹配配音音频
 
