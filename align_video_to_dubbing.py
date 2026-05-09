@@ -534,16 +534,16 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
             pad_dur = 0.0
             if next_start is not None and effective_end > next_start:
                 effective_end = next_start
-            segment_params.append((start, effective_end, v_ratio, a_tempo, wav, next_start, pad_dur, effective_end))
+            segment_params.append((start, effective_end, v_ratio, a_tempo, wav, next_start, pad_dur, effective_end, end))
             continue
 
         if audio_stretch:
             ratio = aud_dur / vid_dur
             if abs(ratio - 1) <= 0.20:
-                segment_params.append((start, end, 1.0, ratio, wav, next_start, 0.0, end))
+                segment_params.append((start, end, 1.0, ratio, wav, next_start, 0.0, end, end))
             else:
                 split = ratio ** 0.5
-                segment_params.append((start, end, split, split, wav, next_start, 0.0, end))
+                segment_params.append((start, end, split, split, wav, next_start, 0.0, end, end))
         else:
             # 音频优先策略
             gap_after = (next_start - end) if next_start is not None else 0.0
@@ -579,7 +579,7 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
             if next_start is not None and effective_end > next_start:
                 effective_end = next_start
 
-            segment_params.append((start, effective_end, v_ratio, a_tempo, wav, next_start, pad_dur, segment_end))
+            segment_params.append((start, effective_end, v_ratio, a_tempo, wav, next_start, pad_dur, segment_end, end))
 
     # ── 构建 filter_complex ──
     video_input = str(Path(video_path).resolve())
@@ -588,7 +588,7 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
     concat_labels = []
     seg_idx = 0
 
-    for idx, (s, e, vr, ar, wav, next_start, pad_dur, seg_end) in enumerate(segment_params):
+    for idx, (s, e, vr, ar, wav, next_start, pad_dur, seg_end, orig_end) in enumerate(segment_params):
         audio_inputs.append(str(Path(wav).resolve()))
         in_audio = idx + 1
 
@@ -612,7 +612,8 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
 
         # 间隙段（用 segment_end 而非 effective_end 计算实际间隙）
         if next_start is not None:
-            gap = next_start - seg_end
+            gap_ref = orig_end if short_mode == "trim" else e
+            gap = next_start - gap_ref
             if gap > 0.01:
                 vl = f'v{seg_idx}'
                 al = f'a{seg_idx}'
