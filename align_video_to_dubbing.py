@@ -9,13 +9,20 @@ import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
 
-# ── RIFE GPU 插帧 (PyTorch, 流式) ──
-try:
-    from rife_interpolator import rife_slowdown
-    _rife_available = True
-except Exception:
-    rife_slowdown = None
-    _rife_available = False
+# ── RIFE GPU 插帧 (PyTorch, 流式) — 懒加载 ──
+__rife_slowdown = None
+_rife_available = False
+
+def _ensure_rife():
+    global __rife_slowdown, _rife_available
+    if __rife_slowdown is not None or _rife_available:
+        return
+    try:
+        from rife_interpolator import rife_slowdown as _rs
+        __rife_slowdown = _rs
+        _rife_available = True
+    except Exception:
+        _rife_available = False
 
 # ── P1 配置常量 ──
 AUDIO_ONLY_THRESHOLD = 0.20           # |ratio-1| 在此阈值内使用纯音频拉伸（视频零损耗），超过则双向分担
@@ -204,17 +211,18 @@ def _cut_and_adjust_segment(video_path, start, end, speed_ratio, output_path):
     else:
         raise ValueError(f"_cut_and_adjust_segment: unsupported speed_ratio {speed_ratio}")
 
-def _rife_slowdown(video_segment, speed_ratio, output_path):
+def __rife_slowdown(video_segment, speed_ratio, output_path):
     """
     RIFE GPU 运动插帧减速 - 流式逐帧处理，显存友好
     策略: RIFE 倍增帧 → setpts=speed_ratio 拉伸时长
     """
-    if not _rife_available or rife_slowdown is None:
+    _ensure_rife()
+    if not _rife_available or __rife_slowdown is None:
         print("      [WARN] RIFE 模块不可用，回退 setpts")
         _setpts_adjust(video_segment, speed_ratio, output_path)
         return False
     
-    ok, elapsed, nframes = rife_slowdown(video_segment, speed_ratio, output_path)
+    ok, elapsed, nframes = _rife_slowdown(video_segment, speed_ratio, output_path)
     return ok
     return ok
 
@@ -255,8 +263,8 @@ def adjust_video_speed(video_segment, speed_ratio, output_path):
     
     # 显著减速 → RIFE GPU 插帧
     if speed_ratio > 1.15:
-        if _rife_available and rife_slowdown:
-            ok = _rife_slowdown(video_segment, speed_ratio, output_path)
+        if _rife_available and _rife_slowdown:
+            ok = __rife_slowdown(video_segment, speed_ratio, output_path)
             if ok:
                 return "rife"
         # RIFE 不可用 → 回退 setpts（避免卡死的 minterpolate）
@@ -370,7 +378,7 @@ def _process_one_segment(args):
                 '-t', str(end-start), '-c:v', 'libx264', '-preset', 'ultrafast', '-crf', '18', '-an',
                 str(adjusted_video)], capture_output=True)
             method = "copy"
-        elif speed_ratio > 1.15 and _rife_available and rife_slowdown is not None:
+        elif speed_ratio > 1.15 and _rife_available and _rife_slowdown is not None:
             # RIFE path needs separate cut step (RIFE takes segment_video as input)
             cut_video_segment(video_path, start, end, segment_video)
             method = adjust_video_speed(segment_video, speed_ratio, adjusted_video)
