@@ -1011,7 +1011,7 @@ if __name__ == "__main__":
     parser.add_argument("--rife", action="store_true",
                         help="启用 RIFE GPU 运动插帧 (默认关闭)")
     parser.add_argument("--short-mode", choices=["apad", "speedup", "trim"], default="trim",
-                        help="trim: 切掉多余视频帧 (默认), apad: 末尾补静音, speedup: 加速视频)"
+                        help="短音频处理: apad(补静音) speedup(加速视频) trim(切多余帧)")
 
     args = parser.parse_args()
 
@@ -1058,7 +1058,7 @@ def main():
     parser.add_argument("--rife", action="store_true",
                         help="启用 RIFE GPU 插帧 (默认关闭)")
     parser.add_argument("--short-mode", choices=["apad", "speedup", "trim"], default="trim",
-                        help="trim: 切掉多余视频帧 (默认), apad: 末尾补静音, speedup: 加速视频)"
+                        help="短音频处理: apad(补静音) speedup(加速视频) trim(切多余帧)")
 
     args = parser.parse_args(sys.argv[1:]) if len(sys.argv) > 1 else parser.parse_args(['-h'])
 
