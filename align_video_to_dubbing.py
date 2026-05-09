@@ -550,12 +550,12 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
             extra = aud_dur - vid_dur
 
             if extra <= 0:
-                # 音频比视频短 → 加速视频匹配音频，无静音
-                effective_end = end  # 视频 trim 用到原始 SRT 窗口
-                v_ratio = aud_dur / vid_dur
+                # 音频比视频短 → 正常播放，末尾补静音对齐视频
+                effective_end = end
+                v_ratio = 1.0
                 a_tempo = 1.0
-                pad_dur = 0.0
-                segment_end = start + aud_dur  # 加速后实际结束点
+                pad_dur = -extra  # apad 补齐静音
+                segment_end = effective_end
             elif extra <= gap_after:
                 effective_end = end + extra
                 v_ratio = 1.0
