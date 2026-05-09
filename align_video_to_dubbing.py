@@ -611,7 +611,7 @@ def _run_single_batch(timestamps, dubbed_files, video_path, output_path, audio_s
         seg_idx += 1
 
         # 间隙段（用 segment_end 而非 effective_end 计算实际间隙）
-        if next_start is not None:
+        if short_mode != "trim" and next_start is not None:
             gap_ref = orig_end if short_mode == "trim" else e
             gap = next_start - gap_ref
             if gap > 0.01:
